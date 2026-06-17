@@ -1,0 +1,101 @@
+# ──────────────────────────────────────────────────────────────────────────
+# SLOs y alertas para app-cicd (.NET)
+#
+# Traducción de las 3 alertas de Google Cloud Monitoring a Prometheus,
+# adaptadas a las métricas que expone prometheus-net.AspNetCore:
+#   - http_requests_received_total{code, method, endpoint}
+#   - http_request_duration_seconds_bucket{code, method, endpoint, le}
+#
+# Stack destino:
+#   - AKS cluster: aks-appcicd-dev (rg-appcicd-dev-eastus)
+#   - Azure Monitor managed Prometheus
+#
+# Se aplica automáticamente con el workflow .github/workflows/deploy-observability.yml
+# cuando hay cambios en k8s/observability/**.
+# ──────────────────────────────────────────────────────────────────────────
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: app-cicd-slo-alerts
+  namespace: monitoring
+  labels:
+    app: app-cicd
+    project: appcicd-dev
+    role: slo-alerts
+spec:
+  groups:
+    # ════════════════════════════════════════════════════════════════════
+    # GRUPO 1 — Recording rules (precalculan los SLIs)
+    # ════════════════════════════════════════════════════════════════════
+    - name: app-cicd.sli.recording
+      interval: 30s
+      rules:
+        - record: app_cicd:http_requests:rate1m
+          expr: sum(rate(http_requests_received_total{job="app-cicd"}[1m]))
+
+        - record: app_cicd:success_ratio:rate1m
+          expr: |
+            sum(rate(http_requests_received_total{job="app-cicd", code=~"2.."}[1m]))
+            /
+            sum(rate(http_requests_received_total{job="app-cicd"}[1m]))
+
+        - record: app_cicd:error_ratio:rate1m
+          expr: |
+            sum(rate(http_requests_received_total{job="app-cicd", code=~"5.."}[1m]))
+            /
+            sum(rate(http_requests_received_total{job="app-cicd"}[1m]))
+
+        - record: app_cicd:http_request_duration:p95
+          expr: |
+            histogram_quantile(
+              0.95,
+              sum(rate(http_request_duration_seconds_bucket{job="app-cicd"}[1m])) by (le)
+            )
+
+    # ════════════════════════════════════════════════════════════════════
+    # GRUPO 2 — Alertas SLO (traducción 1:1 de las 3 alertas de GCP)
+    # ════════════════════════════════════════════════════════════════════
+    - name: app-cicd.slo.alerts
+      rules:
+
+        # ALERTA 1 — Disponibilidad < 99.5%
+        - alert: AppCicdAvailabilityBelow995
+          expr: app_cicd:success_ratio:rate1m < 0.995
+          for: 1m
+          labels:
+            severity: critical
+            slo: availability
+            service: app-cicd
+          annotations:
+            summary: "Disponibilidad de app-cicd por debajo del 99.5%"
+            description: |
+              Tasa de éxito (2xx): {{ $value | humanizePercentage }} (objetivo: ≥ 99.5%).
+            slo_target: "99.5%"
+
+        # ALERTA 2 — Tasa de errores > 0.5%
+        - alert: AppCicdErrorRateAbove05
+          expr: app_cicd:error_ratio:rate1m > 0.005
+          for: 1m
+          labels:
+            severity: critical
+            slo: error-rate
+            service: app-cicd
+          annotations:
+            summary: "Tasa de errores 5xx de app-cicd por encima del 0.5%"
+            description: |
+              Tasa de 5xx: {{ $value | humanizePercentage }} (objetivo: ≤ 0.5%).
+            slo_target: "0.5%"
+
+        # ALERTA 3 — Latencia p95 > 500ms
+        - alert: AppCicdLatencyP95Above500ms
+          expr: app_cicd:http_request_duration:p95 > 0.5
+          for: 1m
+          labels:
+            severity: critical
+            slo: latency
+            service: app-cicd
+          annotations:
+            summary: "Latencia p95 de app-cicd por encima de 500ms"
+            description: |
+              p95: {{ $value | humanizeDuration }} (objetivo: ≤ 500ms).
+            slo_target: "500ms"

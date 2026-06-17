@@ -1,0 +1,28 @@
+# ──────────────────────────────────────────────────────────────────────────
+# PodMonitor — le dice a Azure Monitor managed Prometheus que recoja
+# las métricas del endpoint /metrics de los pods de app-cicd.
+#
+# Selecciona pods por label (debe coincidir con app=app-cicd en deployment.yaml).
+# ──────────────────────────────────────────────────────────────────────────
+apiVersion: azmonitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: app-cicd-podmonitor
+  namespace: monitoring
+  labels:
+    app: app-cicd
+    project: appcicd-dev
+spec:
+  namespaceSelector:
+    any: true
+  selector:
+    matchLabels:
+      app: app-cicd      # debe coincidir con el label del Deployment
+  podMetricsEndpoints:
+    - port: http         # nombre del puerto del pod (ajustar si el deployment usa otro)
+      path: /metrics
+      interval: 30s
+      relabelings:
+        # Sobrescribe el label "job" para que las queries del PrometheusRule funcionen
+        - targetLabel: job
+          replacement: app-cicd
