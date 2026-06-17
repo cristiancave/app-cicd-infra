@@ -19,34 +19,26 @@ En un entorno enterprise, el código de la aplicación y la infraestructura se s
 
 ```mermaid
 flowchart TB
-    subgraph Developer
-        DEV[Desarrollador]
-    end
+    DEV[Desarrollador] -->|git push| REPO_APP[app-cicd<br>Código + CI]
+    DEV -->|terraform apply| REPO_INFRA[app-cicd-infra<br>IaC + CD + Observabilidad]
 
-    subgraph GitHub
-        REPO_APP[app-cicd<br>Código + CI]
-        REPO_INFRA[app-cicd-infra<br>IaC + CD + Observabilidad]
-    end
+    REPO_APP -->|trigger| RESTORE[Restore dependencies]
+    RESTORE --> BUILD_CI[SonarCloud + Static analysis]
+    BUILD_CI --> TEST[Run tests + coverage]
+    TEST --> GRYPE[Security scan - Grype]
+    GRYPE --> DOCKER_PUSH[Push to Docker Hub]
 
-    subgraph "CI - GitHub Actions"
-        RESTORE[Restore dependencies]
-        BUILD_CI[SonarCloud + Static analysis]
-        TEST[Run tests + coverage]
-        GRYPE[Security scan - Grype]
-        DOCKER_PUSH[Push to Docker Hub]
-    end
+    DOCKER_PUSH --> DH[Docker Hub]
+    DOCKER_PUSH --> OIDC[Azure Login - OIDC]
+    OIDC --> AKS_DEPLOY[Deploy to AKS]
 
-    subgraph "CD - GitHub Actions + Jenkins"
-        OIDC[Azure Login - OIDC]
-        AKS_DEPLOY[Deploy to AKS]
-        JENKINS[Jenkins Pipeline<br>Clone → Build → Push → Deploy]
-    end
+    REPO_INFRA -->|Jenkinsfile| JENKINS[Jenkins Pipeline<br>Clone, Build, Push, Deploy]
 
-    subgraph "Azure Cloud"
-        subgraph "rg-keyvault-shared"
-            KV[Azure Key Vault<br>Service Principal credentials]
+    subgraph Azure
+        subgraph rg-keyvault-shared
+            KV[Azure Key Vault<br>SP credentials]
         end
-        subgraph "rg-appcicd-dev-eastus"
+        subgraph rg-appcicd-dev-eastus
             AKS[AKS Cluster<br>aks-appcicd-dev]
             POD1[Pod 1]
             POD2[Pod 2]
@@ -54,27 +46,26 @@ flowchart TB
             POD4[Pod 4]
             SVC[Service LoadBalancer]
         end
-        subgraph "Observability"
+        subgraph Observability
             PROM[Azure Monitor Prometheus<br>mon-appcicd-dev]
             GRAF[Azure Managed Grafana<br>graf-appcicd-dev]
             RULES[Prometheus Rule Groups<br>Recording + Alerting rules]
         end
     end
 
-    subgraph Registry
-        DH[Docker Hub<br>cristiancave/app-cicd]
-    end
-
-    DEV -->|git push| REPO_APP
-    DEV -->|terraform apply| REPO_INFRA
-    REPO_APP -->|trigger| RESTORE
-    RESTORE --> BUILD_CI --> TEST --> GRYPE --> DOCKER_PUSH
-    DOCKER_PUSH --> DH
-    DOCKER_PUSH --> OIDC --> AKS_DEPLOY
     AKS_DEPLOY --> AKS
-    AKS --> POD1 & POD2 & POD3 & POD4
-    POD1 & POD2 & POD3 & POD4 --> SVC
-    POD1 & POD2 & POD3 & POD4 -.->|/metrics| PROM
+    AKS --> POD1
+    AKS --> POD2
+    AKS --> POD3
+    AKS --> POD4
+    POD1 --> SVC
+    POD2 --> SVC
+    POD3 --> SVC
+    POD4 --> SVC
+    POD1 -.->|/metrics| PROM
+    POD2 -.->|/metrics| PROM
+    POD3 -.->|/metrics| PROM
+    POD4 -.->|/metrics| PROM
     PROM --> RULES
     PROM --> GRAF
     KV -.->|secrets| REPO_INFRA
