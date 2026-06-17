@@ -1,6 +1,6 @@
 # app-cicd-infra
 
-Repositorio de infraestructura como código (IaC) y pipeline CD para la aplicación [app-cicd](https://github.com/cristiancave/app-cicd). Este repositorio gestiona toda la infraestructura en Azure y el pipeline de entrega continua con Jenkins, siguiendo el patrón enterprise de separación de responsabilidades entre desarrollo e infraestructura.
+Repositorio de infraestructura como código (IaC) y observabilidad para la aplicación [app-cicd](https://github.com/cristiancave/app-cicd). Gestiona toda la infraestructura en Azure, el pipeline CD con Jenkins, los SLOs de la aplicación y los dashboards de monitoreo, siguiendo el patrón enterprise de separación de responsabilidades entre desarrollo e infraestructura.
 
 [![Jenkins Pipeline](https://img.shields.io/badge/Jenkins-CD_Pipeline-D24939?logo=jenkins&logoColor=white)](Jenkinsfile)
 [![Terraform](https://img.shields.io/badge/Terraform-IaC-7B42BC?logo=terraform&logoColor=white)](terraform/)
@@ -8,12 +8,12 @@ Repositorio de infraestructura como código (IaC) y pipeline CD para la aplicaci
 
 ## ¿Por qué dos repositorios?
 
-En un entorno enterprise, el código de la aplicación y la infraestructura se separan en repositorios distintos por las siguientes razones:
+En un entorno enterprise, el código de la aplicación y la infraestructura se separan en repositorios distintos:
 
-- **Segregación de responsabilidades:** el equipo de desarrollo trabaja en `app-cicd` (código, pruebas, CI) y el equipo de operaciones/DevOps trabaja en `app-cicd-infra` (infraestructura, despliegue, CD).
-- **Control de acceso:** un desarrollador no debería poder modificar la infraestructura de producción, y un ingeniero de infraestructura no necesita acceso al código fuente.
-- **Ciclos de vida independientes:** la infraestructura cambia con poca frecuencia, mientras que el código cambia constantemente. Separarlos evita despliegues innecesarios.
-- **Auditoría:** los cambios en infraestructura se revisan y aprueban por separado, facilitando el cumplimiento normativo.
+- **Segregación de responsabilidades:** el equipo de desarrollo trabaja en `app-cicd` (código, pruebas, CI) y el equipo de operaciones/DevOps trabaja en `app-cicd-infra` (infraestructura, despliegue, CD, observabilidad).
+- **Control de acceso:** un desarrollador no debería poder modificar la infraestructura de producción.
+- **Ciclos de vida independientes:** la infraestructura cambia con poca frecuencia, mientras que el código cambia constantemente.
+- **Auditoría:** los cambios en infraestructura se revisan y aprueban por separado.
 
 ## Arquitectura
 
@@ -25,16 +25,14 @@ flowchart TB
 
     subgraph GitHub
         REPO_APP[app-cicd<br>Código + CI]
-        REPO_INFRA[app-cicd-infra<br>IaC + CD]
+        REPO_INFRA[app-cicd-infra<br>IaC + CD + Observabilidad]
     end
 
     subgraph "CI - GitHub Actions"
         RESTORE[Restore dependencies]
-        BUILD_CI[Static code analysis]
-        TEST[Run tests]
-        FORMAT[Code format check]
+        BUILD_CI[SonarCloud + Static analysis]
+        TEST[Run tests + coverage]
         GRYPE[Security scan - Grype]
-        DOCKER_BUILD[Build Docker image]
         DOCKER_PUSH[Push to Docker Hub]
     end
 
@@ -50,16 +48,16 @@ flowchart TB
         end
         subgraph "rg-appcicd-dev-eastus"
             AKS[AKS Cluster<br>aks-appcicd-dev]
-            POD1[Pod 1 - app-cicd]
-            POD2[Pod 2 - app-cicd]
-            SVC[Service LoadBalancer<br>IP pública]
+            POD1[Pod 1]
+            POD2[Pod 2]
+            POD3[Pod 3]
+            POD4[Pod 4]
+            SVC[Service LoadBalancer]
         end
-        subgraph "MC_rg auto-managed"
-            VMSS[VMSS - Standard_D2s_v7]
-            VNET[Virtual Network]
-            NSG[Network Security Group]
-            LB[Load Balancer]
-            IP[Public IP]
+        subgraph "Observability"
+            PROM[Azure Monitor Prometheus<br>mon-appcicd-dev]
+            GRAF[Azure Managed Grafana<br>graf-appcicd-dev]
+            RULES[Prometheus Rule Groups<br>Recording + Alerting rules]
         end
     end
 
@@ -70,13 +68,15 @@ flowchart TB
     DEV -->|git push| REPO_APP
     DEV -->|terraform apply| REPO_INFRA
     REPO_APP -->|trigger| RESTORE
-    RESTORE --> BUILD_CI --> TEST --> FORMAT --> DOCKER_BUILD --> GRYPE --> DOCKER_PUSH
+    RESTORE --> BUILD_CI --> TEST --> GRYPE --> DOCKER_PUSH
     DOCKER_PUSH --> DH
     DOCKER_PUSH --> OIDC --> AKS_DEPLOY
     AKS_DEPLOY --> AKS
-    AKS --> POD1 & POD2
-    POD1 & POD2 --> SVC
-    SVC --> LB --> IP
+    AKS --> POD1 & POD2 & POD3 & POD4
+    POD1 & POD2 & POD3 & POD4 --> SVC
+    POD1 & POD2 & POD3 & POD4 -.->|/metrics| PROM
+    PROM --> RULES
+    PROM --> GRAF
     KV -.->|secrets| REPO_INFRA
     DH -.->|pull image| AKS
 ```
@@ -85,15 +85,22 @@ flowchart TB
 
 ```
 app-cicd-infra/
-├── terraform/              # Infraestructura como código
-│   ├── main.tf             # Provider Azure + recursos (AKS, Resource Group)
-│   ├── variables.tf        # Variables configurables (región, tamaño VM, etc.)
-│   └── outputs.tf          # Datos de salida (cluster name, kubeconfig)
-├── k8s/                    # Manifiestos de Kubernetes
-│   ├── deployment.yaml     # Deployment con 2 réplicas, probes y resource limits
-│   └── service.yaml        # Service LoadBalancer con IP pública
-├── Jenkinsfile             # Pipeline CD con Jenkins
-├── .gitignore              # Excluye .terraform/, tfstate, tfvars
+├── terraform/                         # Infraestructura como código
+│   ├── main.tf                        # Provider Azure + recursos (AKS, Resource Group)
+│   ├── variables.tf                   # Variables configurables
+│   └── outputs.tf                     # Datos de salida (cluster name, kubeconfig)
+├── k8s/                               # Manifiestos de Kubernetes
+│   ├── deployment.yaml                # Deployment con 4 réplicas, probes, resource limits
+│   ├── service.yaml                   # Service LoadBalancer con IP pública
+│   └── observability/                 # Configuración de observabilidad
+│       ├── namespace.yaml             # Namespace monitoring
+│       └── podmonitor.yaml            # PodMonitor para scraping de /metrics
+├── bicep/                             # IaC Azure nativa
+│   └── prometheus-rules.bicep         # Recording rules (SLI) + Alerting rules (SLO)
+├── grafana/                           # Dashboards
+│   └── app-cicd-slo-dashboard.json    # Dashboard SLO con 7 paneles
+├── Jenkinsfile                        # Pipeline CD con Jenkins
+├── .gitignore                         # Excluye .terraform/, tfstate, tfvars
 └── README.md
 ```
 
@@ -101,39 +108,41 @@ app-cicd-infra/
 
 | Tecnología | Propósito | Justificación DevOps |
 |---|---|---|
-| **Terraform** | Infraestructura como código | Permite crear, modificar y destruir infraestructura de forma reproducible, versionada y auditada. Agnóstico de nube. |
-| **Azure Key Vault** | Gestión de secretos | Almacena las credenciales del Service Principal de forma centralizada y encriptada, eliminando secretos hardcodeados. |
-| **Azure AKS** | Orquestación de contenedores | Kubernetes administrado por Azure. Ofrece escalado automático, alta disponibilidad y self-healing de pods. |
-| **Jenkins** | Pipeline CD | Herramienta de CI/CD auto-hospedada, extensible con plugins, agnóstica de proveedor de repositorios. Estándar en enterprise. |
-| **Docker Hub** | Registro de imágenes | Almacena las imágenes Docker publicadas por el pipeline CI. En producción se usaría Azure Container Registry (ACR) para mayor seguridad y velocidad. |
-| **OIDC Federation** | Autenticación sin secretos | GitHub Actions se autentica en Azure sin almacenar contraseñas, usando tokens temporales basados en confianza federada. |
+| **Terraform** | Infraestructura como código | Crea, modifica y destruye infraestructura de forma reproducible y versionada. Agnóstico de nube. |
+| **Bicep** | IaC Azure nativa | Define Prometheus Rule Groups en formato nativo de Azure (Terraform no soporta este CRD). |
+| **Azure Key Vault** | Gestión de secretos | Almacena credenciales del Service Principal encriptadas con RBAC. |
+| **Azure AKS** | Orquestación de contenedores | Kubernetes administrado con escalado, alta disponibilidad y self-healing. |
+| **Azure Monitor Prometheus** | Recolección de métricas | Prometheus managed por Azure, sin infraestructura adicional. Scraping automático via PodMonitor. |
+| **Azure Managed Grafana** | Dashboards de monitoreo | Dashboards SLO con visualización de disponibilidad, error rate y latencia p95. |
+| **Jenkins** | Pipeline CD | Auto-hospedado, independiente de proveedor. Estándar en enterprise. |
+| **Docker Hub** | Registro de imágenes | Almacena imágenes Docker. En producción se usaría ACR. |
+| **OIDC Federation** | Autenticación sin secretos | GitHub Actions se autentica en Azure con tokens temporales. |
 
 ## Terraform — Infraestructura como código
 
 ### Recursos creados
 
-Terraform gestiona los siguientes recursos en Azure:
+1. **Resource Group** (`rg-appcicd-dev-eastus`) — contenedor lógico para los recursos.
+2. **AKS Cluster** (`aks-appcicd-dev`) — cluster Kubernetes con 3 nodos `Standard_D2ls_v7`, tier Free, identidad `SystemAssigned`.
 
-1. **Resource Group** (`rg-appcicd-dev-eastus`) — contenedor lógico para todos los recursos del proyecto.
-2. **AKS Cluster** (`aks-appcicd-dev`) — cluster de Kubernetes con 1 nodo `Standard_D2s_v7`, tier Free, identidad administrada `SystemAssigned`.
-
-Adicionalmente, se crearon manualmente (fuera de Terraform) para la gestión de secretos:
-
-3. **Resource Group** (`rg-keyvault-shared`) — separado porque es compartido entre proyectos y ambientes.
-4. **Key Vault** (`kv-appcicd-shared`) — almacena `sp-client-id`, `sp-client-secret` y `sp-tenant-id`.
+Creados manualmente:
+3. **Resource Group** (`rg-keyvault-shared`) — separado porque es compartido entre proyectos.
+4. **Key Vault** (`kv-appcicd-shared`) — almacena `sp-client-id`, `sp-client-secret`, `sp-tenant-id`.
 
 ### Naming convention
 
-Todos los recursos siguen la convención `tipo-proyecto-ambiente-región`:
-
-- `rg-appcicd-dev-eastus` → Resource Group, proyecto appcicd, ambiente dev, región eastus
-- `aks-appcicd-dev` → AKS Cluster, proyecto appcicd, ambiente dev
-- `kv-appcicd-shared` → Key Vault, proyecto appcicd, compartido entre ambientes
-- `sp-appcicd-dev` → Service Principal, proyecto appcicd, ambiente dev
+| Recurso | Nombre | Patrón |
+|---|---|---|
+| Resource Group | `rg-appcicd-dev-eastus` | tipo-proyecto-ambiente-región |
+| AKS Cluster | `aks-appcicd-dev` | tipo-proyecto-ambiente |
+| Key Vault | `kv-appcicd-shared` | tipo-proyecto-scope |
+| Service Principal | `sp-appcicd-dev` | tipo-proyecto-ambiente |
+| Monitor Workspace | `mon-appcicd-dev` | tipo-proyecto-ambiente |
+| Grafana | `graf-appcicd-dev` | tipo-proyecto-ambiente |
 
 ### Integración con Key Vault
 
-Terraform lee los secretos del Service Principal directamente desde Azure Key Vault usando `data sources`, eliminando la necesidad de tener credenciales en archivos locales o variables de entorno:
+Terraform lee secretos desde Azure Key Vault usando data sources:
 
 ```hcl
 data "azurerm_key_vault_secret" "client_id" {
@@ -145,29 +154,20 @@ data "azurerm_key_vault_secret" "client_id" {
 ### Comandos de uso
 
 ```bash
-# Inicializar Terraform (descarga proveedores)
 cd terraform/
-terraform init
-
-# Ver plan de cambios sin aplicar
-terraform plan
-
-# Crear la infraestructura
-terraform apply
-
-# Destruir toda la infraestructura (ahorra créditos)
-terraform destroy
+terraform init        # Descarga proveedores
+terraform plan        # Vista previa de cambios
+terraform apply       # Crear infraestructura
+terraform destroy     # Destruir todo (ahorra créditos)
 ```
 
 ### Gestión de costos
 
-El cluster AKS se puede detener para no generar costos cuando no está en uso:
-
 ```bash
-# Detener el cluster (deja de cobrar por VMs)
+# Detener cluster (deja de cobrar por VMs)
 az aks stop --resource-group rg-appcicd-dev-eastus --name aks-appcicd-dev
 
-# Iniciar el cluster
+# Iniciar cluster
 az aks start --resource-group rg-appcicd-dev-eastus --name aks-appcicd-dev
 ```
 
@@ -175,72 +175,130 @@ az aks start --resource-group rg-appcicd-dev-eastus --name aks-appcicd-dev
 
 ### deployment.yaml
 
-Define el despliegue de la aplicación con las siguientes características enterprise:
-
-- **2 réplicas** — alta disponibilidad; si un pod falla, el otro sigue atendiendo.
-- **Readiness probe** — Kubernetes verifica `/health` cada 10 segundos antes de enviar tráfico al pod.
-- **Liveness probe** — Kubernetes verifica `/health` cada 15 segundos; si falla, reinicia el pod automáticamente.
-- **Resource requests/limits** — cada pod tiene garantizados 100m CPU y 128Mi RAM, con límite de 250m CPU y 256Mi RAM. Evita que un pod consuma todos los recursos del nodo.
+- **4 réplicas** — alta disponibilidad y distribución de carga entre nodos.
+- **Readiness probe** — verifica `/health` cada 10s antes de enviar tráfico.
+- **Liveness probe** — verifica `/health` cada 15s; si falla, reinicia el pod.
+- **Resource requests/limits** — CPU y memoria garantizados y limitados.
+- **Puerto nombrado `http`** — requerido por el PodMonitor para scraping de métricas Prometheus.
 
 ### service.yaml
 
-Expone la aplicación a internet mediante un `LoadBalancer` de Azure:
-
+Expone la aplicación a internet mediante `LoadBalancer` de Azure:
 - Puerto externo: **80** (estándar web)
 - Puerto interno: **8080** (donde escucha la app .NET)
-- Azure crea automáticamente un Azure Load Balancer con IP pública.
+
+## Observabilidad y SLOs
+
+### Arquitectura de observabilidad
+
+```
+App .NET (4 pods) → expone /metrics
+    ↓
+PodMonitor (scrape cada 30s)
+    ↓
+Azure Monitor managed Prometheus (mon-appcicd-dev)
+    ↓
+Prometheus Rule Groups (definidos en Bicep)
+    ├── 4 Recording rules (precálculos SLI)
+    └── 3 Alerting rules (disparan cuando se violan SLOs)
+    ↓
+Azure Managed Grafana (graf-appcicd-dev)
+    └── Dashboard SLO con 7 paneles visuales
+```
+
+### SLOs definidos
+
+| SLO | Objetivo | Métrica base |
+|---|---|---|
+| **Disponibilidad** | ≥ 99.5% | Tasa de respuestas 2xx sobre total de peticiones |
+| **Error rate** | ≤ 0.5% | Tasa de respuestas 5xx sobre total de peticiones |
+| **Latencia p95** | ≤ 500ms | Percentil 95 de duración de peticiones HTTP |
+
+### Componentes implementados
+
+**k8s/observability/namespace.yaml:**
+Crea el namespace `monitoring` donde vive el PodMonitor.
+
+**k8s/observability/podmonitor.yaml:**
+Le dice a Azure Monitor Prometheus que scrapee el endpoint `/metrics` de los pods con label `app: app-cicd` cada 30 segundos.
+
+**bicep/prometheus-rules.bicep:**
+Define en formato Azure nativo (porque Azure managed no soporta el CRD `PrometheusRule` de Kubernetes):
+- **4 Recording rules:** precalculan los SLIs (tasa de peticiones, tasa de errores, latencia p95, tasa de disponibilidad) para consultas eficientes.
+- **3 Alerting rules:** disparan cuando un SLO se viola (disponibilidad < 99.5%, error rate > 0.5%, latencia p95 > 500ms).
+
+Para aplicar las reglas:
+```bash
+az deployment group create \
+  --resource-group rg-appcicd-dev-eastus \
+  --template-file bicep/prometheus-rules.bicep
+```
+
+**grafana/app-cicd-slo-dashboard.json:**
+Dashboard con 7 paneles para importar en Azure Managed Grafana:
+- Disponibilidad actual (gauge)
+- Error rate actual (gauge)
+- Latencia p95 actual (gauge)
+- Request rate por código HTTP (time series)
+- Error rate histórico (time series)
+- Latencia por percentil (time series)
+- Estado de SLOs (table)
+
+Para importar: Grafana → Dashboards → New → Import → subir el JSON.
+
+### Verificación
+
+```bash
+# Ver estado del PodMonitor
+kubectl get podmonitors -n monitoring
+
+# Ver Prometheus Rule Groups en Azure
+az resource list --resource-type Microsoft.AlertsManagement/prometheusRuleGroups
+
+# Ver métricas en vivo (Grafana → Explore)
+# Datasource: Managed_Prometheus_mon-appcicd-dev
+# Query: http_requests_received_total{job="app-cicd"}
+
+# Verificar que /metrics responde
+curl http://<EXTERNAL-IP>/metrics
+```
 
 ## Jenkins — Pipeline CD
 
-El `Jenkinsfile` define un pipeline declarativo con 4 stages que representan el flujo de entrega continua:
+El `Jenkinsfile` define un pipeline declarativo con 4 stages:
 
 | Stage | Descripción | Comando principal |
 |---|---|---|
 | **Clone repository** | Descarga el código fuente desde GitHub | `git branch: 'main', url: '...'` |
-| **Build Docker image** | Construye la imagen Docker con el código compilado | `docker build -t image:tag .` |
-| **Push to Docker Hub** | Publica la imagen en el registro (dos tags: versión + latest) | `docker push image:tag` |
-| **Deploy to AKS** | Actualiza el deployment en AKS con la nueva imagen | `kubectl set image deployment/...` |
+| **Build Docker image** | Construye la imagen Docker | `docker build -t image:tag .` |
+| **Push to Docker Hub** | Publica la imagen (versión + latest) | `docker push image:tag` |
+| **Deploy to AKS** | Actualiza el deployment en AKS | `kubectl set image deployment/...` |
 
 ### ¿Por qué Jenkins además de GitHub Actions?
 
-El proyecto implementa **dos herramientas de CI/CD** por diseño:
-
-- **GitHub Actions** maneja el CI y el CD automatizado. Se integra nativamente con GitHub y usa OIDC para autenticarse en Azure sin secretos almacenados.
-- **Jenkins** representa el patrón de CD auto-hospedado, común en empresas que requieren control total sobre su infraestructura de pipelines, independencia de proveedor de repositorios, y personalización avanzada con plugins.
-
-Ambas herramientas coexisten sin conflicto porque operan en fases distintas del ciclo de vida.
+- **GitHub Actions** maneja CI y CD automatizado. Se integra con GitHub y usa OIDC para autenticarse en Azure sin secretos.
+- **Jenkins** representa el patrón de CD auto-hospedado, común en empresas que requieren control total e independencia de proveedor.
 
 ## Seguridad
 
 ### Service Principal con RBAC
-
-Se creó un Service Principal (`sp-appcicd-dev`) con rol `Contributor` limitado exclusivamente a la suscripción del proyecto. Principio de menor privilegio: puede crear y modificar recursos, pero no puede gestionar accesos de otros usuarios.
+`sp-appcicd-dev` con rol `Contributor` limitado a la suscripción. Puede crear y modificar recursos, pero no gestionar accesos.
 
 ### Azure Key Vault
+Credenciales encriptadas con acceso controlado por RBAC (`Key Vault Secrets Officer`). Nunca en código ni variables de entorno.
 
-Las credenciales del Service Principal se almacenan encriptadas en Azure Key Vault con acceso controlado por RBAC (`Key Vault Secrets Officer`). Nunca se almacenan en código, archivos de configuración ni variables de entorno persistentes.
-
-### OIDC Federation (Credenciales federadas)
-
-GitHub Actions se autentica en Azure mediante OIDC (OpenID Connect), eliminando la necesidad de almacenar el `clientSecret` en GitHub:
-
-1. GitHub genera un token temporal que identifica el repositorio y la rama.
-2. Azure verifica el token contra la credencial federada configurada.
-3. Azure otorga acceso temporal (minutos) al Service Principal.
-4. No hay contraseñas almacenadas que puedan filtrarse o expirar.
-
-La credencial federada está configurada exclusivamente para `repo:cristiancave/app-cicd:ref:refs/heads/main`, lo que significa que solo la rama `main` de ese repositorio específico puede autenticarse.
+### OIDC Federation
+GitHub Actions se autentica con tokens temporales. Configurado exclusivamente para `repo:cristiancave/app-cicd:ref:refs/heads/main`.
 
 ### Nota sobre Trivy
-
-Inicialmente se consideró Trivy (Aqua Security) para escaneo de vulnerabilidades de imágenes Docker. Sin embargo, en marzo de 2026 Trivy sufrió un ataque a la cadena de suministro (CVE-2026-33634) que comprometió GitHub Actions, binarios y Docker Hub images, inyectando malware que exfiltraba credenciales de CI/CD. Se optó por **Grype** (Anchore) como alternativa segura para el escaneo de imágenes en el pipeline CI.
+Descartado tras el ataque de cadena de suministro de marzo 2026 (CVE-2026-33634). Se usa **Grype** (Anchore) como alternativa segura.
 
 ## Repositorio relacionado
 
 | Repositorio | Responsabilidad |
 |---|---|
-| [app-cicd](https://github.com/cristiancave/app-cicd) | Código fuente de la aplicación .NET, Dockerfile, pipeline CI (GitHub Actions), pipeline CD automatizado a AKS |
-| [app-cicd-infra](https://github.com/cristiancave/app-cicd-infra) | Infraestructura como código (Terraform), manifiestos de Kubernetes, pipeline CD (Jenkins) |
+| [app-cicd](https://github.com/cristiancave/app-cicd) | Código fuente, Dockerfile, CI/CD (GitHub Actions), métricas Prometheus |
+| [app-cicd-infra](https://github.com/cristiancave/app-cicd-infra) | Terraform, K8s manifests, Bicep (SLO rules), Grafana dashboard, Jenkins |
 
 ## Prerequisitos
 
