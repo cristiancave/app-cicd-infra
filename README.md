@@ -1,288 +1,326 @@
-# app-cicd-infra
+# app-cicd
 
-Repositorio de infraestructura como código (IaC) y observabilidad para la aplicación [app-cicd](https://github.com/cristiancave/app-cicd). Gestiona toda la infraestructura en Azure, el pipeline CD con Jenkins, los SLOs de la aplicación y los dashboards de monitoreo, siguiendo el patrón enterprise de separación de responsabilidades entre desarrollo e infraestructura.
+API de gestión de biblioteca (Library Management) construida con .NET 10, desplegada en Azure Kubernetes Service (AKS) mediante un pipeline CI/CD completamente automatizado. Cada push a `main` compila, prueba, analiza, escanea vulnerabilidades, publica la imagen Docker y despliega a producción sin intervención manual.
 
-[![Jenkins Pipeline](https://img.shields.io/badge/Jenkins-CD_Pipeline-D24939?logo=jenkins&logoColor=white)](Jenkinsfile)
-[![Terraform](https://img.shields.io/badge/Terraform-IaC-7B42BC?logo=terraform&logoColor=white)](terraform/)
-[![Kubernetes](https://img.shields.io/badge/Kubernetes-AKS-326CE5?logo=kubernetes&logoColor=white)](k8s/)
+[![CI/CD](https://github.com/cristiancave/app-cicd/actions/workflows/ci.yml/badge.svg)](https://github.com/cristiancave/app-cicd/actions/workflows/ci.yml)
+[![Docker Hub](https://img.shields.io/badge/Docker%20Hub-cristiancave%2Fapp--cicd-2496ED?logo=docker&logoColor=white)](https://hub.docker.com/r/cristiancave/app-cicd)
+[![Kubernetes](https://img.shields.io/badge/Deployed%20on-Azure%20AKS-326CE5?logo=kubernetes&logoColor=white)](#despliegue-en-aks)
+[![Snyk](https://img.shields.io/badge/Snyk-Dependency%20Scan-4C4A73?logo=snyk&logoColor=white)](https://app.snyk.io)
 
-## ¿Por qué dos repositorios?
+## La aplicación
 
-En un entorno enterprise, el código de la aplicación y la infraestructura se separan en repositorios distintos:
+La API simula un sistema de gestión de biblioteca que permite administrar libros y préstamos. Se eligió este dominio porque tiene lógica de negocio real (validación de copias disponibles, cálculo de vencimientos, estadísticas) que va más allá de un CRUD básico y demuestra un caso de uso realista.
 
-- **Segregación de responsabilidades:** el equipo de desarrollo trabaja en `app-cicd` (código, pruebas, CI) y el equipo de operaciones/DevOps trabaja en `app-cicd-infra` (infraestructura, despliegue, CD, observabilidad).
-- **Control de acceso:** un desarrollador no debería poder modificar la infraestructura de producción.
-- **Ciclos de vida independientes:** la infraestructura cambia con poca frecuencia, mientras que el código cambia constantemente.
-- **Auditoría:** los cambios en infraestructura se revisan y aprueban por separado.
+### Endpoints disponibles
 
-## Arquitectura
+**Health Check y Observabilidad:**
+| Método | Endpoint | Descripción |
+|---|---|---|
+| `GET` | `/health` | Estado de la aplicación. Usado por Kubernetes para readiness y liveness probes |
+| `GET` | `/swagger` | Documentación interactiva OpenAPI (Swagger UI) |
+| `GET` | `/metrics` | Métricas Prometheus (http_requests_received_total, http_request_duration_seconds, etc.) |
 
-```mermaid
-flowchart TB
-    DEV[Desarrollador] -->|git push| REPO_APP[app-cicd<br>Código + CI]
-    DEV -->|terraform apply| REPO_INFRA[app-cicd-infra<br>IaC + CD + Observabilidad]
+**Libros:**
+| Método | Endpoint | Descripción |
+|---|---|---|
+| `GET` | `/api/books` | Listar todos los libros |
+| `GET` | `/api/books/{id}` | Obtener libro por ID |
+| `POST` | `/api/books` | Registrar un nuevo libro |
+| `PUT` | `/api/books/{id}` | Actualizar un libro existente |
+| `DELETE` | `/api/books/{id}` | Eliminar un libro |
+| `GET` | `/api/books/available` | Filtrar libros con copias disponibles |
+| `GET` | `/api/books/genre/{genre}` | Filtrar por género (Fiction, NonFiction, Science, Technology, History, Art, Philosophy) |
+| `GET` | `/api/books/search?query=texto` | Buscar por título o autor |
 
-    REPO_APP -->|trigger| RESTORE[Restore dependencies]
-    RESTORE --> BUILD_CI[SonarCloud + Static analysis]
-    BUILD_CI --> TEST[Run tests + coverage]
-    TEST --> GRYPE[Security scan - Grype]
-    GRYPE --> DOCKER_PUSH[Push to Docker Hub]
+**Préstamos:**
+| Método | Endpoint | Descripción |
+|---|---|---|
+| `GET` | `/api/loans` | Listar todos los préstamos |
+| `POST` | `/api/loans` | Crear préstamo (reduce copias disponibles automáticamente) |
+| `POST` | `/api/loans/{id}/return` | Devolver libro (actualiza estado y aumenta copias disponibles) |
+| `GET` | `/api/loans/active` | Filtrar préstamos activos |
+| `GET` | `/api/loans/overdue` | Filtrar préstamos vencidos |
 
-    DOCKER_PUSH --> DH[Docker Hub]
-    DOCKER_PUSH --> OIDC[Azure Login - OIDC]
-    OIDC --> AKS_DEPLOY[Deploy to AKS]
+**Estadísticas:**
+| Método | Endpoint | Descripción |
+|---|---|---|
+| `GET` | `/api/stats` | Total de libros, préstamos activos, libros más prestados |
 
-    REPO_INFRA -->|Jenkinsfile| JENKINS[Jenkins Pipeline<br>Clone, Build, Push, Deploy]
+### Lógica de negocio
 
-    subgraph Azure
-        subgraph rg-keyvault-shared
-            KV[Azure Key Vault<br>SP credentials]
-        end
-        subgraph rg-appcicd-dev-eastus
-            AKS[AKS Cluster<br>aks-appcicd-dev]
-            POD1[Pod 1]
-            POD2[Pod 2]
-            POD3[Pod 3]
-            POD4[Pod 4]
-            SVC[Service LoadBalancer]
-        end
-        subgraph Observability
-            PROM[Azure Monitor Prometheus<br>mon-appcicd-dev]
-            GRAF[Azure Managed Grafana<br>graf-appcicd-dev]
-            RULES[Prometheus Rule Groups<br>Recording + Alerting rules]
-        end
-    end
+- Al crear un préstamo, la API **valida que haya copias disponibles** del libro. Si no hay, retorna `400 Bad Request`.
+- Al crear un préstamo, `availableCopies` del libro se **reduce automáticamente**.
+- Al devolver un libro, `availableCopies` se **incrementa**, `returnDate` se registra y `status` cambia a `Returned`.
+- El endpoint `/api/loans/overdue` compara `dueDate` con la fecha actual para detectar préstamos vencidos que aún no se han devuelto.
 
-    AKS_DEPLOY --> AKS
-    AKS --> POD1
-    AKS --> POD2
-    AKS --> POD3
-    AKS --> POD4
-    POD1 --> SVC
-    POD2 --> SVC
-    POD3 --> SVC
-    POD4 --> SVC
-    POD1 -.->|/metrics| PROM
-    POD2 -.->|/metrics| PROM
-    POD3 -.->|/metrics| PROM
-    POD4 -.->|/metrics| PROM
-    PROM --> RULES
-    PROM --> GRAF
-    KV -.->|secrets| REPO_INFRA
-    DH -.->|pull image| AKS
+## Observabilidad y SLOs
+
+La aplicación expone métricas Prometheus estándar mediante el paquete `prometheus-net.AspNetCore`. El endpoint `/metrics` es scrapeado automáticamente por Azure Monitor managed Prometheus cada 30 segundos.
+
+### Métricas expuestas
+
+El endpoint `/metrics` expone automáticamente:
+
+| Métrica | Tipo | Descripción |
+|---|---|---|
+| `http_requests_received_total` | Counter | Total de peticiones HTTP recibidas, etiquetadas por método, endpoint y código de respuesta |
+| `http_request_duration_seconds` | Histogram | Duración de cada petición en segundos (incluye percentiles p50, p90, p95, p99) |
+| `http_requests_in_progress` | Gauge | Peticiones siendo procesadas en este momento |
+
+### SLOs definidos
+
+Se definieron 3 Service Level Objectives para monitorear la salud de la aplicación en producción:
+
+| SLO | Objetivo | Descripción |
+|---|---|---|
+| **Disponibilidad** | ≥ 99.5% | Tasa de respuestas exitosas (2xx) sobre el total de peticiones |
+| **Error rate** | ≤ 0.5% | Tasa de respuestas con error de servidor (5xx) |
+| **Latencia p95** | ≤ 500ms | El 95% de las peticiones deben responder en menos de 500 milisegundos |
+
+### Integración con Prometheus
+
+La aplicación expone métricas con solo dos líneas de código en `Program.cs`:
+
+```csharp
+app.UseHttpMetrics();   // Intercepta cada petición y registra métricas
+app.MapMetrics();       // Expone el endpoint /metrics en formato Prometheus
 ```
+
+El paquete `prometheus-net.AspNetCore` se encarga del resto: instrumenta automáticamente cada endpoint y genera las métricas estándar que Azure Monitor Prometheus recolecta.
+
+### Implementación
+
+```
+App .NET (4 pods)
+    ↓ expone /metrics
+Azure Monitor managed Prometheus (PodMonitor scrape cada 30s)
+    ↓
+Prometheus Rule Groups (Bicep)
+    ├── 4 Recording rules (precálculos SLI)
+    └── 3 Alerting rules (disparan cuando se violan SLOs)
+    ↓
+Azure Managed Grafana
+    └── Dashboard SLO con 7 paneles visuales
+```
+
+Para más detalles sobre la infraestructura de observabilidad (PodMonitor, Bicep rules, dashboard Grafana), ver el repo [app-cicd-infra](https://github.com/cristiancave/app-cicd-infra).
 
 ## Estructura del repositorio
 
 ```
-app-cicd-infra/
-├── terraform/                         # Infraestructura como código
-│   ├── main.tf                        # Provider Azure + recursos (AKS, Resource Group)
-│   ├── variables.tf                   # Variables configurables
-│   └── outputs.tf                     # Datos de salida (cluster name, kubeconfig)
-├── k8s/                               # Manifiestos de Kubernetes
-│   ├── deployment.yaml                # Deployment con 4 réplicas, probes, resource limits
-│   ├── service.yaml                   # Service LoadBalancer con IP pública
-│   └── observability/                 # Configuración de observabilidad
-│       ├── namespace.yaml             # Namespace monitoring
-│       └── podmonitor.yaml            # PodMonitor para scraping de /metrics
-├── bicep/                             # IaC Azure nativa
-│   └── prometheus-rules.bicep         # Recording rules (SLI) + Alerting rules (SLO)
-├── grafana/                           # Dashboards
-│   └── app-cicd-slo-dashboard.json    # Dashboard SLO con 7 paneles
-├── Jenkinsfile                        # Pipeline CD con Jenkins
-├── .gitignore                         # Excluye .terraform/, tfstate, tfvars
+app-cicd/
+├── AppCicd/                       # Código fuente de la API
+│   ├── Program.cs                 # Endpoints Minimal API + Swagger + Prometheus metrics
+│   ├── Models/                    # Modelos de datos (Book, Loan, Enums)
+│   ├── AppCicd.csproj             # Proyecto .NET con analizadores Roslyn + prometheus-net
+│   └── appsettings.json           # Configuración de la aplicación
+├── AppCicd.Tests/                 # Pruebas unitarias y de integración
+│   ├── *Tests.cs                  # Tests con xUnit + WebApplicationFactory
+│   └── AppCicd.Tests.csproj       # Proyecto de tests
+├── .github/
+│   └── workflows/
+│       └── ci.yml                 # Pipeline CI/CD (GitHub Actions)
+├── Dockerfile                     # Multi-stage build (SDK → Runtime)
+├── .dockerignore                  # Excluye bin/, obj/, .git del contexto Docker
+├── .gitignore                     # Excluye archivos de compilación
 └── README.md
 ```
 
-## Tecnologías y justificación
+## Pipeline CI/CD
 
-| Tecnología | Propósito | Justificación DevOps |
+El archivo `ci.yml` define dos jobs que se ejecutan en secuencia:
+
+```mermaid
+flowchart LR
+    subgraph "Job 1: build-and-test (CI)"
+        A[Checkout] --> B[Setup .NET]
+        B --> C[Restore]
+        C --> D[Snyk scan]
+        D --> E[SonarCloud begin]
+        E --> F[Build + analysis]
+        F --> G[Run tests + coverage]
+        G --> H[SonarCloud end]
+        H --> I[Format check]
+        I --> J[Build image]
+        J --> K[Grype scan]
+        K --> L[Push to Docker Hub]
+    end
+
+    subgraph "Job 2: deploy-to-aks (CD)"
+        M[Azure login OIDC] --> N[Get AKS credentials]
+        N --> O[Deploy + rollout]
+    end
+
+    L -->|"Solo en main"| M
+```
+
+### Job 1: build-and-test (CI)
+
+Se ejecuta en **cada push y pull request**:
+
+| Step | Qué hace | Por qué es importante |
 |---|---|---|
-| **Terraform** | Infraestructura como código | Crea, modifica y destruye infraestructura de forma reproducible y versionada. Agnóstico de nube. |
-| **Bicep** | IaC Azure nativa | Define Prometheus Rule Groups en formato nativo de Azure (Terraform no soporta este CRD). |
-| **Azure Key Vault** | Gestión de secretos | Almacena credenciales del Service Principal encriptadas con RBAC. |
-| **Azure AKS** | Orquestación de contenedores | Kubernetes administrado con escalado, alta disponibilidad y self-healing. |
-| **Azure Monitor Prometheus** | Recolección de métricas | Prometheus managed por Azure, sin infraestructura adicional. Scraping automático via PodMonitor. |
-| **Azure Managed Grafana** | Dashboards de monitoreo | Dashboards SLO con visualización de disponibilidad, error rate y latencia p95. |
-| **Jenkins** | Pipeline CD | Auto-hospedado, independiente de proveedor. Estándar en enterprise. |
-| **Docker Hub** | Registro de imágenes | Almacena imágenes Docker. En producción se usaría ACR. |
-| **OIDC Federation** | Autenticación sin secretos | GitHub Actions se autentica en Azure con tokens temporales. |
+| **Checkout** | Descarga el código con historial completo | SonarCloud necesita el historial para análisis incremental |
+| **Setup .NET + Java** | Instala SDK .NET 10 y Java 17 | SonarScanner requiere Java para ejecutarse |
+| **Restore** | Descarga paquetes NuGet | Separado del build para aprovechar cache |
+| **Snyk scan** | Escanea dependencias NuGet por vulnerabilidades conocidas | Detecta CVEs en paquetes de terceros antes de compilar. Complementa Grype (imagen) y SonarCloud (código) |
+| **SonarCloud begin** | Inicia análisis estático con SonarCloud | Envuelve el build para capturar información de análisis |
+| **Build** | Compila con analizadores Roslyn y --warnaserror | Detecta bugs, code smells y vulnerabilidades en compilación |
+| **Run tests + coverage** | Pruebas con xUnit y reporte de cobertura OpenCover | Valida lógica de negocio y mide cobertura de código |
+| **SonarCloud end** | Cierra y sube resultados a SonarCloud | Dashboard de calidad en sonarcloud.io |
+| **Format check** | Verifica formato con dotnet format | Asegura consistencia de estilo |
+| **Build image** | Construye imagen Docker multi-stage | Imagen final ~200MB vs ~800MB con SDK |
+| **Grype scan** | Escanea imagen Docker por CVEs | Si encuentra vulnerabilidades críticas, la imagen no se publica |
+| **Push to Docker Hub** | Publica la imagen | Solo si todos los pasos anteriores pasaron |
 
-## Terraform — Infraestructura como código
+### Job 2: deploy-to-aks (CD)
 
-### Recursos creados
+Se ejecuta **solo en la rama `main`** y solo si el Job 1 fue exitoso:
 
-1. **Resource Group** (`rg-appcicd-dev-eastus`) — contenedor lógico para los recursos.
-2. **AKS Cluster** (`aks-appcicd-dev`) — cluster Kubernetes con 3 nodos `Standard_D2ls_v7`, tier Free, identidad `SystemAssigned`.
-
-Creados manualmente:
-3. **Resource Group** (`rg-keyvault-shared`) — separado porque es compartido entre proyectos.
-4. **Key Vault** (`kv-appcicd-shared`) — almacena `sp-client-id`, `sp-client-secret`, `sp-tenant-id`.
-
-### Naming convention
-
-| Recurso | Nombre | Patrón |
+| Step | Qué hace | Por qué es importante |
 |---|---|---|
-| Resource Group | `rg-appcicd-dev-eastus` | tipo-proyecto-ambiente-región |
-| AKS Cluster | `aks-appcicd-dev` | tipo-proyecto-ambiente |
-| Key Vault | `kv-appcicd-shared` | tipo-proyecto-scope |
-| Service Principal | `sp-appcicd-dev` | tipo-proyecto-ambiente |
-| Monitor Workspace | `mon-appcicd-dev` | tipo-proyecto-ambiente |
-| Grafana | `graf-appcicd-dev` | tipo-proyecto-ambiente |
+| **Azure login (OIDC)** | Se autentica en Azure sin contraseñas | Credenciales federadas: token temporal, sin secretos almacenados |
+| **Get AKS credentials** | Descarga el kubeconfig del cluster | Permite ejecutar comandos kubectl |
+| **Deploy to AKS** | Actualiza imagen y reinicia los pods | kubectl set image + rollout restart + rollout status |
 
-### Integración con Key Vault
+### Seguridad en el pipeline: 3 capas complementarias
 
-Terraform lee secretos desde Azure Key Vault usando data sources:
+El pipeline implementa un modelo de seguridad por capas donde cada herramienta cubre un ámbito distinto:
 
-```hcl
-data "azurerm_key_vault_secret" "client_id" {
-  name         = "sp-client-id"
-  key_vault_id = data.azurerm_key_vault.shared.id
-}
-```
-
-### Comandos de uso
-
-```bash
-cd terraform/
-terraform init        # Descarga proveedores
-terraform plan        # Vista previa de cambios
-terraform apply       # Crear infraestructura
-terraform destroy     # Destruir todo (ahorra créditos)
-```
-
-### Gestión de costos
-
-```bash
-# Detener cluster (deja de cobrar por VMs)
-az aks stop --resource-group rg-appcicd-dev-eastus --name aks-appcicd-dev
-
-# Iniciar cluster
-az aks start --resource-group rg-appcicd-dev-eastus --name aks-appcicd-dev
-```
-
-## Kubernetes — Manifiestos de despliegue
-
-### deployment.yaml
-
-- **4 réplicas** — alta disponibilidad y distribución de carga entre nodos.
-- **Readiness probe** — verifica `/health` cada 10s antes de enviar tráfico.
-- **Liveness probe** — verifica `/health` cada 15s; si falla, reinicia el pod.
-- **Resource requests/limits** — CPU y memoria garantizados y limitados.
-- **Puerto nombrado `http`** — requerido por el PodMonitor para scraping de métricas Prometheus.
-
-### service.yaml
-
-Expone la aplicación a internet mediante `LoadBalancer` de Azure:
-- Puerto externo: **80** (estándar web)
-- Puerto interno: **8080** (donde escucha la app .NET)
-
-## Observabilidad y SLOs
-
-### Arquitectura de observabilidad
-
-```
-App .NET (4 pods) → expone /metrics
-    ↓
-PodMonitor (scrape cada 30s)
-    ↓
-Azure Monitor managed Prometheus (mon-appcicd-dev)
-    ↓
-Prometheus Rule Groups (definidos en Bicep)
-    ├── 4 Recording rules (precálculos SLI)
-    └── 3 Alerting rules (disparan cuando se violan SLOs)
-    ↓
-Azure Managed Grafana (graf-appcicd-dev)
-    └── Dashboard SLO con 7 paneles visuales
-```
-
-### SLOs definidos
-
-| SLO | Objetivo | Métrica base |
+| Herramienta | Qué escanea | Cuándo actúa |
 |---|---|---|
-| **Disponibilidad** | ≥ 99.5% | Tasa de respuestas 2xx sobre total de peticiones |
-| **Error rate** | ≤ 0.5% | Tasa de respuestas 5xx sobre total de peticiones |
-| **Latencia p95** | ≤ 500ms | Percentil 95 de duración de peticiones HTTP |
+| **SonarCloud** | Tu código fuente (bugs, code smells, vulnerabilidades) | Durante el build |
+| **Snyk** | Tus dependencias (paquetes NuGet de terceros) | Después del restore, antes del build |
+| **Grype** | Tu imagen Docker (imagen base + runtime + dependencias del SO) | Después del build, antes del push |
 
-### Componentes implementados
+Esta separación garantiza que ningún vector de ataque pase sin ser revisado: el código propio, las librerías externas y la imagen final de despliegue.
 
-**k8s/observability/namespace.yaml:**
-Crea el namespace `monitoring` donde vive el PodMonitor.
+### ¿Por qué Grype y no Trivy?
 
-**k8s/observability/podmonitor.yaml:**
-Le dice a Azure Monitor Prometheus que scrapee el endpoint `/metrics` de los pods con label `app: app-cicd` cada 30 segundos.
+En marzo de 2026, Trivy (Aqua Security) sufrió un ataque a la cadena de suministro (CVE-2026-33634) que comprometió GitHub Actions, binarios de release e imágenes Docker Hub. Los atacantes inyectaron malware que exfiltraba credenciales de CI/CD desde los runners. Se seleccionó **Grype** (Anchore) como alternativa segura. Adicionalmente, se integró **Snyk** para escanear las dependencias del proyecto (paquetes NuGet). Mientras Grype escanea la imagen Docker completa, Snyk se enfoca específicamente en las dependencias del código fuente, proporcionando una segunda capa de análisis que cubre vulnerabilidades a nivel de librería.
 
-**bicep/prometheus-rules.bicep:**
-Define en formato Azure nativo (porque Azure managed no soporta el CRD `PrometheusRule` de Kubernetes):
-- **4 Recording rules:** precalculan los SLIs (tasa de peticiones, tasa de errores, latencia p95, tasa de disponibilidad) para consultas eficientes.
-- **3 Alerting rules:** disparan cuando un SLO se viola (disponibilidad < 99.5%, error rate > 0.5%, latencia p95 > 500ms).
+## Dockerfile
 
-Para aplicar las reglas:
-```bash
-az deployment group create \
-  --resource-group rg-appcicd-dev-eastus \
-  --template-file bicep/prometheus-rules.bicep
+La imagen usa **multi-stage build** para optimizar tamaño y seguridad:
+
+```
+Stage 1 (build):  SDK ~800MB  → Compila y publica la app
+Stage 2 (final):  Runtime ~200MB → Solo copia los binarios compilados
 ```
 
-**grafana/app-cicd-slo-dashboard.json:**
-Dashboard con 7 paneles para importar en Azure Managed Grafana:
-- Disponibilidad actual (gauge)
-- Error rate actual (gauge)
-- Latencia p95 actual (gauge)
-- Request rate por código HTTP (time series)
-- Error rate histórico (time series)
-- Latencia por percentil (time series)
-- Estado de SLOs (table)
+Beneficios:
+- Imagen final ~75% más pequeña que si incluyera el SDK completo.
+- Sin código fuente en la imagen final, solo binarios compilados.
+- Sin herramientas de desarrollo que podrían ser explotadas.
+- Cache de capas: copia primero el .csproj para aprovechar cache de dependencias.
 
-Para importar: Grafana → Dashboards → New → Import → subir el JSON.
+## Pruebas
 
-### Verificación
+Pruebas de integración con **xUnit** y **WebApplicationFactory**:
 
-```bash
-# Ver estado del PodMonitor
-kubectl get podmonitors -n monitoring
+- Health check retorna 200 OK
+- CRUD completo de libros (crear, leer, actualizar, eliminar)
+- Filtros por género, disponibilidad y búsqueda
+- Creación de préstamos reduce copias disponibles
+- Préstamo falla si no hay copias (400 Bad Request)
+- Devolución incrementa copias y cambia estado
+- Filtro de préstamos activos y vencidos
+- Estadísticas retornan datos correctos
 
-# Ver Prometheus Rule Groups en Azure
-az resource list --resource-type Microsoft.AlertsManagement/prometheusRuleGroups
+Los tests se ejecutan automáticamente en cada push con reporte de cobertura enviado a SonarCloud.
 
-# Ver métricas en vivo (Grafana → Explore)
-# Datasource: Managed_Prometheus_mon-appcicd-dev
-# Query: http_requests_received_total{job="app-cicd"}
+## Análisis estático de código
 
-# Verificar que /metrics responde
-curl http://<EXTERNAL-IP>/metrics
+Se utilizan dos herramientas complementarias:
+
+**Analizadores Roslyn (.NET nativo):**
+```xml
+<TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+<EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+<AnalysisLevel>latest-recommended</AnalysisLevel>
 ```
 
-## Jenkins — Pipeline CD
+**SonarCloud (análisis en la nube):**
+- Detecta bugs, vulnerabilidades, code smells y duplicación
+- Mide cobertura de código con reportes OpenCover
+- Dashboard público en sonarcloud.io con Quality Gate
 
-El `Jenkinsfile` define un pipeline declarativo con 4 stages:
+## Despliegue en AKS
 
-| Stage | Descripción | Comando principal |
-|---|---|---|
-| **Clone repository** | Descarga el código fuente desde GitHub | `git branch: 'main', url: '...'` |
-| **Build Docker image** | Construye la imagen Docker | `docker build -t image:tag .` |
-| **Push to Docker Hub** | Publica la imagen (versión + latest) | `docker push image:tag` |
-| **Deploy to AKS** | Actualiza el deployment en AKS | `kubectl set image deployment/...` |
+La aplicación corre en Azure Kubernetes Service con la siguiente configuración:
 
-### ¿Por qué Jenkins además de GitHub Actions?
+- **4 réplicas** para alta disponibilidad y distribución de carga
+- **Readiness probe** en `/health` — Kubernetes verifica que el pod esté listo antes de enviarle tráfico
+- **Liveness probe** en `/health` — si el pod deja de responder, Kubernetes lo reinicia
+- **Resource limits** — cada pod tiene CPU y memoria limitados
+- **LoadBalancer** — Azure asigna una IP pública
+- **Puerto nombrado `http`** — requerido por el PodMonitor para scraping de métricas
 
-- **GitHub Actions** maneja CI y CD automatizado. Se integra con GitHub y usa OIDC para autenticarse en Azure sin secretos.
-- **Jenkins** representa el patrón de CD auto-hospedado, común en empresas que requieren control total e independencia de proveedor.
+### Acceso a la aplicación
+
+```
+http://<EXTERNAL-IP>/health         # Health check
+http://<EXTERNAL-IP>/swagger        # Documentación interactiva
+http://<EXTERNAL-IP>/api/books      # API de libros
+http://<EXTERNAL-IP>/metrics        # Métricas Prometheus
+```
+
+Para obtener la IP actual:
+```bash
+kubectl get service app-cicd-service
+```
+
+## Ejecución local
+
+### Con .NET directamente
+```bash
+cd AppCicd/
+dotnet run
+# Abrir http://localhost:5232/swagger
+```
+
+### Con Docker
+```bash
+docker build -t app-cicd:local .
+docker run -p 8080:8080 app-cicd:local
+# Abrir http://localhost:8080/swagger
+```
+
+### Ejecutar pruebas
+```bash
+dotnet test AppCicd.Tests/AppCicd.Tests.csproj --verbosity normal
+```
 
 ## Seguridad
 
-### Service Principal con RBAC
-`sp-appcicd-dev` con rol `Contributor` limitado a la suscripción. Puede crear y modificar recursos, pero no gestionar accesos.
+| Capa | Mecanismo | Descripción |
+|---|---|---|
+| **Código** | Analizadores Roslyn + SonarCloud | Detección de bugs, vulnerabilidades y code smells |
+| **Dependencias** | Snyk | Escaneo de vulnerabilidades en paquetes NuGet |
+| **Formato** | dotnet format | Consistencia de estilo |
+| **Imagen Docker** | Grype (Anchore) | Escaneo de CVEs en imagen base y dependencias del SO |
+| **Autenticación Azure** | OIDC Federation | Tokens temporales, sin contraseñas almacenadas |
+| **Service Principal** | RBAC (Contributor) | Menor privilegio, limitado a la suscripción |
+| **Secretos** | GitHub Secrets + Azure Key Vault | Encriptados, nunca en código |
+| **Kubernetes** | Probes + Resource limits | Self-healing y aislamiento de recursos |
+| **Monitoreo** | SLOs + Alertas Prometheus | Detección proactiva de degradación del servicio |
 
-### Azure Key Vault
-Credenciales encriptadas con acceso controlado por RBAC (`Key Vault Secrets Officer`). Nunca en código ni variables de entorno.
+## Tecnologías
 
-### OIDC Federation
-GitHub Actions se autentica con tokens temporales. Configurado exclusivamente para `repo:cristiancave/app-cicd:ref:refs/heads/main`.
-
-### Nota sobre Trivy
-Descartado tras el ataque de cadena de suministro de marzo 2026 (CVE-2026-33634). Se usa **Grype** (Anchore) como alternativa segura.
+| Tecnología | Versión | Propósito |
+|---|---|---|
+| .NET | 10.0 | Framework de la API (Minimal APIs) |
+| prometheus-net | - | Exposición de métricas Prometheus |
+| xUnit | - | Framework de pruebas |
+| Docker | Multi-stage | Contenerización de la aplicación |
+| GitHub Actions | v6 | Pipeline CI/CD automatizado |
+| SonarCloud | - | Análisis estático y cobertura de código |
+| Snyk | CLI | Escaneo de vulnerabilidades en dependencias |
+| Grype | v6 | Escaneo de vulnerabilidades de imágenes |
+| Azure AKS | Kubernetes 1.34 | Orquestación de contenedores |
+| Azure Monitor Prometheus | Managed | Recolección y almacenamiento de métricas |
+| Azure Managed Grafana | - | Dashboards de monitoreo y SLOs |
+| OIDC | Federation | Autenticación sin secretos |
 
 ## Repositorio relacionado
 
@@ -290,11 +328,3 @@ Descartado tras el ataque de cadena de suministro de marzo 2026 (CVE-2026-33634)
 |---|---|
 | [app-cicd](https://github.com/cristiancave/app-cicd) | Código fuente, Dockerfile, CI/CD (GitHub Actions), métricas Prometheus |
 | [app-cicd-infra](https://github.com/cristiancave/app-cicd-infra) | Terraform, K8s manifests, Bicep (SLO rules), Grafana dashboard, Jenkins |
-
-## Prerequisitos
-
-- [Terraform](https://developer.hashicorp.com/terraform/install) >= 1.0
-- [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli) >= 2.50
-- [kubectl](https://kubernetes.io/docs/tasks/tools/) >= 1.28
-- [Docker Desktop](https://www.docker.com/products/docker-desktop/) (para Jenkins local)
-- Cuenta de Azure con suscripción activa
