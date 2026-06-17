@@ -19,7 +19,7 @@ pipeline {
         stage('Build Docker image') {
             steps {
                 echo "Building Docker image: ${DOCKER_IMAGE}:${IMAGE_TAG}"
-                echo 'docker build -t ${DOCKER_IMAGE}:${IMAGE_TAG} .'
+                sh 'docker build -t ${DOCKER_IMAGE}:${IMAGE_TAG} -t ${DOCKER_IMAGE}:latest .'
                 echo 'Docker image built successfully'
             }
         }
@@ -27,7 +27,17 @@ pipeline {
         stage('Push to Docker Hub') {
             steps {
                 echo "Pushing image: ${DOCKER_IMAGE}:${IMAGE_TAG}"
-                echo "Pushing image: ${DOCKER_IMAGE}:latest"
+                withCredentials([usernamePassword(
+                    credentialsId: 'dockerhub-credentials',
+                    usernameVariable: 'DOCKER_USER',
+                    passwordVariable: 'DOCKER_PASS'
+                )]) {
+                    sh '''
+                        echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
+                        docker push ${DOCKER_IMAGE}:${IMAGE_TAG}
+                        docker push ${DOCKER_IMAGE}:latest
+                    '''
+                }
                 echo 'Image pushed to Docker Hub successfully'
             }
         }
@@ -35,19 +45,22 @@ pipeline {
         stage('Deploy to AKS') {
             steps {
                 echo "Deploying to AKS cluster: ${AKS_CLUSTER}"
-                echo "kubectl set image deployment/app-cicd app-cicd=${DOCKER_IMAGE}:${IMAGE_TAG}"
-                echo "kubectl rollout status deployment/app-cicd"
+                withCredentials([azureServicePrincipal('azure-sp-appcicd')]) {
+                    sh '''
+                        az login --service-principal \
+                            -u $AZURE_CLIENT_ID \
+                            -p $AZURE_CLIENT_SECRET \
+                            --tenant $AZURE_TENANT_ID
+                        az aks get-credentials \
+                            --resource-group ${AKS_RG} \
+                            --name ${AKS_CLUSTER} \
+                            --overwrite-existing
+                        kubectl apply -f k8s/deployment.yaml
+                        kubectl apply -f k8s/service.yaml
+                        kubectl set image deployment/app-cicd app-cicd=${DOCKER_IMAGE}:${IMAGE_TAG}
+                        kubectl rollout status deployment/app-cicd
+                    '''
+                }
                 echo 'Deployment to AKS completed successfully'
             }
         }
-    }
-
-    post {
-        success {
-            echo 'Pipeline completed successfully.'
-        }
-        failure {
-            echo 'Pipeline failed.'
-        }
-    }
-}
